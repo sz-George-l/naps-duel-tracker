@@ -1,0 +1,268 @@
+#!/bin/bash
+#SBATCH --job-name=naps_h5
+#SBATCH --output=slurm_%j_naps.out
+#SBATCH --error=slurm_%j_naps.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=12:00:00
+#SBATCH --mem=32G
+#SBATCH --mail-type=END
+#SBATCH --mail-user=YOUR_EMAIL_HERE
+
+set -euo pipefail
+
+module purge
+
+###############################################################################
+# NAPS identity assignment + SLEAP conversion + H5 filtering (CPU)
+#
+# Inputs:   SLEAP predictions (.slp) + raw videos (.mp4)
+# Outputs:  NAPS-labeled .slp  -> converted analysis .h5 -> filtered .h5
+#
+# Default behavior loops over hours (07..18) and uses filename patterns.
+# All paths and key parameters can be overridden via --export or environment vars.
+#
+# Example:
+# sbatch --export=ALL,\
+#COLONY=natural_colony_fixed,DATE=20250827,HOURS="07 08 09",\
+#VIDEO_DIR=/path/to/videos,SLP_DIR=/path/to/pred_slp,\
+#NAPS_OUT_DIR=/path/to/naps_slp,H5_OUT_DIR=/path/to/h5,\
+#FILTERED_H5_OUT_DIR=/path/to/h5_filtered,\
+#H5_FILTER_SCRIPT=/path/to/h5_filter.py,\
+#USE_CONTAINER=1,SIF_PATH=/path/to/ubuntu.sif,OVERLAY_PATH=/path/to/overlay.ext3:ro,\
+#ENV_SH=env.sh \
+#hpc/slurm_02_naps_and_filter.sbatch
+###############################################################################
+
+# -----------------------------
+# User-configurable parameters
+# -----------------------------
+
+# Identifiers (only used if you build paths from them)
+COLONY="${COLONY:-colony}"
+DATE="${DATE:-YYYYMMDD}"
+
+# Where raw videos are located
+VIDEO_DIR="${VIDEO_DIR:-/path/to/videos}"
+
+# Where SLEAP prediction .slp files are located (output of Stage 1)
+SLP_DIR="${SLP_DIR:-/path/to/sleap_predictions}"
+
+# Where to write NAPS .slp outputs
+NAPS_OUT_DIR="${NAPS_OUT_DIR:-/path/to/naps_outputs}"
+
+# Where to write converted analysis .h5 outputs
+H5_OUT_DIR="${H5_OUT_DIR:-/path/to/h5_outputs}"
+
+# Where to write filtered .h5 outputs
+FILTERED_H5_OUT_DIR="${FILTERED_H5_OUT_DIR:-/path/to/h5_filtered_outputs}"
+
+# Filtering script (recommend keeping this inside your repo, e.g. src/h5_filter.py)
+H5_FILTER_SCRIPT="${H5_FILTER_SCRIPT:-src/h5_filter.py}"
+
+# Hours to process (space-separated). Default matches your workflow.
+HOURS="${HOURS:-07 08 09 10 11 12 13 14 15 16 17 18}"
+
+# Filename pattern (edit these if your camera name differs)
+CAMERA_PREFIX="${CAMERA_PREFIX:-basler_record_camera0}"
+VIDEO_EXT="${VIDEO_EXT:-mp4}"
+# SLEAP output suffix from Stage 1
+SLEAP_SLP_SUFFIX="${SLEAP_SLP_SUFFIX:-.mp4_tracked.slp}"
+# NAPS output suffix
+NAPS_SLP_SUFFIX="${NAPS_SLP_SUFFIX:-.mp4.NAPS.slp}"
+
+# NAPS parameters (override if needed)
+START_FRAME="${START_FRAME:-0}"
+END_FRAME="${END_FRAME:-108000}"
+ARUCO_MARKER_SET="${ARUCO_MARKER_SET:-DICT_3X3_512}"
+ARUCO_CROP_SIZE="${ARUCO_CROP_SIZE:-40}"
+ARUCO_WIN_MAX="${ARUCO_WIN_MAX:-30}"
+ARUCO_WIN_STEP="${ARUCO_WIN_STEP:-12}"
+ARUCO_WIN_MIN="${ARUCO_WIN_MIN:-10}"
+ARUCO_ERR_CORR="${ARUCO_ERR_CORR:-0.2}"
+HALF_ROLLING_WINDOW="${HALF_ROLLING_WINDOW:-20}"
+
+# Conda environments
+NAPS_ENV="${NAPS_ENV:-naps}"
+SLEAP_ENV="${SLEAP_ENV:-sleap}"
+
+# -----------------------------
+# Container settings (optional)
+# If you are not using Singularity/Apptainer, set USE_CONTAINER=0
+# -----------------------------
+USE_CONTAINER="${USE_CONTAINER:-1}"
+SIF_PATH="${SIF_PATH:-/path/to/ubuntu-22.04.sif}"
+OVERLAY_PATH="${OVERLAY_PATH:-/path/to/overlay.ext3:ro}"
+ENV_SH="${ENV_SH:-env.sh}"
+
+mkdir -p "$NAPS_OUT_DIR" "$H5_OUT_DIR" "$FILTERED_H5_OUT_DIR"
+
+echo "=== NAPS + convert + filter ==="
+echo "COLONY            : $COLONY"
+echo "DATE              : $DATE"
+echo "VIDEO_DIR         : $VIDEO_DIR"
+echo "SLP_DIR           : $SLP_DIR"
+echo "NAPS_OUT_DIR      : $NAPS_OUT_DIR"
+echo "H5_OUT_DIR        : $H5_OUT_DIR"
+echo "FILTERED_H5_OUT   : $FILTERED_H5_OUT_DIR"
+echo "H5_FILTER_SCRIPT  : $H5_FILTER_SCRIPT"
+echo "HOURS             : $HOURS"
+echo "USE_CONTAINER     : $USE_CONTAINER"
+echo
+
+# Basic checks
+if [[ ! -d "$VIDEO_DIR" ]]; then
+  echo "ERROR: VIDEO_DIR not found: $VIDEO_DIR" >&2
+  exit 1
+fi
+if [[ ! -d "$SLP_DIR" ]]; then
+  echo "ERROR: SLP_DIR not found: $SLP_DIR" >&2
+  exit 1
+fi
+if [[ ! -f "$H5_FILTER_SCRIPT" ]]; then
+  echo "ERROR: H5_FILTER_SCRIPT not found: $H5_FILTER_SCRIPT" >&2
+  exit 1
+fi
+
+run_in_container_or_host() {
+  local cmd="$1"
+  if [[ "$USE_CONTAINER" == "1" ]]; then
+    if [[ ! -e "$SIF_PATH" ]]; then
+      echo "ERROR: SIF_PATH not found: $SIF_PATH" >&2
+      exit 1
+    fi
+    if [[ ! -e "${OVERLAY_PATH%%:*}" ]]; then
+      echo "ERROR: OVERLAY_PATH not found: ${OVERLAY_PATH%%:*}" >&2
+      exit 1
+    fi
+    singularity exec \
+      --overlay "$OVERLAY_PATH" \
+      "$SIF_PATH" \
+      /bin/bash -lc "
+        set -euo pipefail
+        if [[ -f \"$ENV_SH\" ]]; then source \"$ENV_SH\"; fi
+        $cmd
+      "
+  else
+    if [[ -f "$ENV_SH" ]]; then
+      # shellcheck disable=SC1090
+      source "$ENV_SH"
+    fi
+    eval "$cmd"
+  fi
+}
+
+# Build a bash snippet to run inside the container (or on host)
+cmd=$(cat <<'EOF'
+set -euo pipefail
+
+# Make conda available in non-interactive shells if needed
+if command -v conda >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+fi
+
+echo "[1/2] NAPS identity assignment..."
+conda activate "__NAPS_ENV__"
+
+for hr in __HOURS_LIST__; do
+  VIDEO_FILE="__VIDEO_DIR__/__CAMERA_PREFIX___${DATE}_${hr}.__VIDEO_EXT__"
+  SLP_FILE="__SLP_DIR__/__CAMERA_PREFIX___${DATE}_${hr}__SLEAP_SLP_SUFFIX__"
+  NAPS_FILE="__NAPS_OUT_DIR__/__CAMERA_PREFIX___${DATE}_${hr}__NAPS_SLP_SUFFIX__"
+
+  if [[ -f "$NAPS_FILE" ]]; then
+    echo "Skipping NAPS (exists): $NAPS_FILE"
+    continue
+  fi
+
+  if [[ ! -f "$SLP_FILE" ]]; then
+    echo "WARNING: Missing SLEAP SLP: $SLP_FILE (skipping hour $hr)"
+    continue
+  fi
+  if [[ ! -f "$VIDEO_FILE" ]]; then
+    echo "WARNING: Missing video: $VIDEO_FILE (skipping hour $hr)"
+    continue
+  fi
+
+  echo "Running NAPS: $VIDEO_FILE"
+  naps-track \
+    --slp-path "$SLP_FILE" \
+    --video-path "$VIDEO_FILE" \
+    --start-frame __START_FRAME__ \
+    --end-frame __END_FRAME__ \
+    --aruco-marker-set __ARUCO_MARKER_SET__ \
+    --aruco-crop-size __ARUCO_CROP_SIZE__ \
+    --aruco-adaptive-thresh-win-size-max __ARUCO_WIN_MAX__ \
+    --aruco-adaptive-thresh-win-size-step __ARUCO_WIN_STEP__ \
+    --aruco-adaptive-thresh-win-size-min __ARUCO_WIN_MIN__ \
+    --aruco-error-correction-rate __ARUCO_ERR_CORR__ \
+    --half-rolling-window-size __HALF_ROLLING_WINDOW__ \
+    --output-path "$NAPS_FILE"
+done
+
+conda deactivate
+
+echo "[2/2] Convert NAPS SLP → H5 and filter..."
+conda activate "__SLEAP_ENV__"
+
+for hr in __HOURS_LIST__; do
+  NAPS_FILE="__NAPS_OUT_DIR__/__CAMERA_PREFIX___${DATE}_${hr}__NAPS_SLP_SUFFIX__"
+  H5_FILE="__H5_OUT_DIR__/__CAMERA_PREFIX___${DATE}_${hr}.h5"
+  FILTERED_H5_FILE="__FILTERED_H5_OUT__/__CAMERA_PREFIX___${DATE}_${hr}_filtered.h5"
+
+  if [[ -f "$FILTERED_H5_FILE" ]]; then
+    echo "Skipping filtered (exists): $FILTERED_H5_FILE"
+    continue
+  fi
+
+  if [[ ! -f "$NAPS_FILE" ]]; then
+    echo "WARNING: Missing NAPS SLP: $NAPS_FILE (skipping hour $hr)"
+    continue
+  fi
+
+  if [[ ! -f "$H5_FILE" ]]; then
+    echo "Converting to H5: $NAPS_FILE → $H5_FILE"
+    sleap-convert --format analysis -o "$H5_FILE" "$NAPS_FILE"
+  else
+    echo "H5 exists: $H5_FILE"
+  fi
+
+  echo "Filtering: $H5_FILE → $FILTERED_H5_FILE"
+  python "__H5_FILTER_SCRIPT__" "$H5_FILE" "$FILTERED_H5_FILE"
+done
+
+conda deactivate
+echo "Done."
+EOF
+)
+
+# Replace placeholders in the command snippet
+cmd="${cmd//__NAPS_ENV__/$NAPS_ENV}"
+cmd="${cmd//__SLEAP_ENV__/$SLEAP_ENV}"
+cmd="${cmd//__VIDEO_DIR__/$VIDEO_DIR}"
+cmd="${cmd//__SLP_DIR__/$SLP_DIR}"
+cmd="${cmd//__NAPS_OUT_DIR__/$NAPS_OUT_DIR}"
+cmd="${cmd//__H5_OUT_DIR__/$H5_OUT_DIR}"
+cmd="${cmd//__FILTERED_H5_OUT__/$FILTERED_H5_OUT_DIR}"
+cmd="${cmd//__H5_FILTER_SCRIPT__/$H5_FILTER_SCRIPT}"
+cmd="${cmd//__CAMERA_PREFIX__/$CAMERA_PREFIX}"
+cmd="${cmd//__VIDEO_EXT__/$VIDEO_EXT}"
+cmd="${cmd//__SLEAP_SLP_SUFFIX__/$SLEAP_SLP_SUFFIX}"
+cmd="${cmd//__NAPS_SLP_SUFFIX__/$NAPS_SLP_SUFFIX}"
+cmd="${cmd//__START_FRAME__/$START_FRAME}"
+cmd="${cmd//__END_FRAME__/$END_FRAME}"
+cmd="${cmd//__ARUCO_MARKER_SET__/$ARUCO_MARKER_SET}"
+cmd="${cmd//__ARUCO_CROP_SIZE__/$ARUCO_CROP_SIZE}"
+cmd="${cmd//__ARUCO_WIN_MAX__/$ARUCO_WIN_MAX}"
+cmd="${cmd//__ARUCO_WIN_STEP__/$ARUCO_WIN_STEP}"
+cmd="${cmd//__ARUCO_WIN_MIN__/$ARUCO_WIN_MIN}"
+cmd="${cmd//__ARUCO_ERR_CORR__/$ARUCO_ERR_CORR}"
+cmd="${cmd//__HALF_ROLLING_WINDOW__/$HALF_ROLLING_WINDOW}"
+
+# Convert HOURS to a quoted list for the snippet
+hours_list=""
+for hr in $HOURS; do hours_list="$hours_list \"$hr\""; done
+cmd="${cmd//__HOURS_LIST__/$hours_list}"
+
+run_in_container_or_host "$cmd"

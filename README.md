@@ -76,12 +76,43 @@ conda env create -f envs/sleap.yml
 conda env create -f envs/naps.yml
 conda env create -f envs/duel-tracker.yml
 
-
 Note: GPU/CUDA versions are system-dependent and are not hard-coded in the environment files. See docs/installation.md for recommended configurations.
 
-sbatch hpc/slurm_01_sleap_predict.sbatch
-sbatch hpc/slurm_02_naps_and_filter.sbatch
-sbatch hpc/slurm_03_duel_tracker.sbatch
+ArUco dictionary requirement (NAPS)
+
+NAPS relies on OpenCV’s ArUco module for identity assignment.
+The official NAPS release (Python 3.7, legacy OpenCV) does not include a 3×3 dictionary, while our experiments use a custom 3×3 ArUco dictionary (512 tags).
+
+To reproduce our results, one small modification is required.
+
+Required change
+
+Edit the following file inside your NAPS environment:
+
+<conda_env>/lib/python3.7/site-packages/naps/aruco.py
+
+
+Locate the line:
+
+return cv2.aruco.Dictionary_get(ARUCO_DICT[tag_set])
+
+
+and replace it with:
+
+# Custom 3x3 ArUco dictionary (used in this project)
+aruco_tag_dict = cv2.aruco.custom_dictionary(512, 3)
+
+# IDs actually printed and used in experiments
+desired_id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+subset_dict = cv2.aruco.Dictionary_create(len(desired_id),
+                                          aruco_tag_dict.markerSize)
+subset_dict.bytesList = aruco_tag_dict.bytesList[desired_id]
+
+return subset_dict
+
+Note: This modification is required because OpenCV versions shipped with
+Python 3.7 do not support extendDictionary().
 
 Usage
 HPC (SLURM)

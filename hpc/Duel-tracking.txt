@@ -1,0 +1,196 @@
+#!/bin/bash
+#SBATCH --job-name=duel_predict
+#SBATCH --output=slurm_%j_duel_predict.out
+#SBATCH --error=slurm_%j_duel_predict.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=128G
+#SBATCH --gres=gpu:1
+#SBATCH --time=12:00:00
+#SBATCH --mail-type=END
+#SBATCH --mail-user=YOUR_EMAIL_HERE
+
+set -euo pipefail
+
+module purge
+
+###############################################################################
+# Duel-tracker (ST-GCN) inference on filtered pose H5 files
+#
+# Inputs:  *_filtered.h5 (or any .h5)
+# Outputs: *_predictions.csv (or configurable suffix)
+#
+# This script is written to be portable:
+# - All important paths can be set via environment variables before sbatch.
+# - Defaults are placeholders; set them for your cluster.
+#
+# Example:
+#   sbatch \
+#     --export=ALL,INPUT_ROOT=/path/to/h5_filtered,OUTPUT_ROOT=/path/to/preds,\
+#MODEL_DIR=/path/to/model,SCRIPT_PATH=/path/to/duel_tracker_prediction.py,\
+#CONDA_ENV=duel-tracker \
+#     hpc/slurm_03_duel_tracker.sbatch
+###############################################################################
+
+# -----------------------------
+# User-configurable parameters
+# -----------------------------
+
+# Path to the duel-tracker prediction script (repo path or absolute path)
+SCRIPT_PATH="${SCRIPT_PATH:-/path/to/duel_tracker_prediction.py}"
+
+# Directory containing the trained model checkpoint/config expected by SCRIPT_PATH
+MODEL_DIR="${MODEL_DIR:-/path/to/duel_tracker_model_dir}"
+
+# Root directory containing one or more subfolders of .h5 files (or a flat folder of .h5 files)
+INPUT_ROOT="${INPUT_ROOT:-/path/to/filtered_h5_root}"
+
+# Where to write prediction CSVs (mirrors subfolder structure under INPUT_ROOT)
+OUTPUT_ROOT="${OUTPUT_ROOT:-/path/to/duel_predictions_out}"
+
+# Conda environment name for duel-tracker
+CONDA_ENV="${CONDA_ENV:-duel-tracker}"
+
+# Optional: add a suffix for output CSVs (default: replace .h5 with _predictions.csv)
+PRED_SUFFIX="${PRED_SUFFIX:-_predictions.csv}"
+
+# -----------------------------
+# Container settings (optional)
+# If you are not using Singularity/Apptainer, set USE_CONTAINER=0
+# -----------------------------
+USE_CONTAINER="${USE_CONTAINER:-1}"
+SIF_PATH="${SIF_PATH:-/path/to/ubuntu-22.04.sif}"
+OVERLAY_PATH="${OVERLAY_PATH:-/path/to/overlay.ext3:ro}"
+
+# Optional: a script that sets up conda inside the container (or on bare metal)
+ENV_SH="${ENV_SH:-env.sh}"
+
+# Optional: base working directory (useful on clusters)
+WORKDIR="${WORKDIR:-$PWD}"
+
+mkdir -p "$OUTPUT_ROOT"
+cd "$WORKDIR"
+
+echo "=== Duel-tracker SLURM job ==="
+echo "SCRIPT_PATH : $SCRIPT_PATH"
+echo "MODEL_DIR   : $MODEL_DIR"
+echo "INPUT_ROOT  : $INPUT_ROOT"
+echo "OUTPUT_ROOT : $OUTPUT_ROOT"
+echo "CONDA_ENV   : $CONDA_ENV"
+echo "USE_CONTAINER: $USE_CONTAINER"
+echo
+
+# Basic checks
+if [[ ! -e "$SCRIPT_PATH" ]]; then
+  echo "ERROR: SCRIPT_PATH not found: $SCRIPT_PATH" >&2
+  exit 1
+fi
+if [[ ! -d "$MODEL_DIR" ]]; then
+  echo "ERROR: MODEL_DIR not found: $MODEL_DIR" >&2
+  exit 1
+fi
+if [[ ! -d "$INPUT_ROOT" ]]; then
+  echo "ERROR: INPUT_ROOT not found: $INPUT_ROOT" >&2
+  exit 1
+fi
+
+# Helper: run a command either inside container or directly
+run_cmd() {
+  local cmd="$1"
+
+  if [[ "$USE_CONTAINER" == "1" ]]; then
+    if [[ ! -e "$SIF_PATH" ]]; then
+      echo "ERROR: SIF_PATH not found: $SIF_PATH" >&2
+      exit 1
+    fi
+    if [[ ! -e "${OVERLAY_PATH%%:*}" ]]; then
+      echo "ERROR: OVERLAY_PATH not found: ${OVERLAY_PATH%%:*}" >&2
+      exit 1
+    fi
+
+    singularity exec --nv \
+      --overlay "$OVERLAY_PATH" \
+      "$SIF_PATH" \
+      /bin/bash -lc "
+        set -euo pipefail
+        if [[ -f \"$ENV_SH\" ]]; then source \"$ENV_SH\"; fi
+        conda activate \"$CONDA_ENV\"
+        $cmd
+      "
+  else
+    # Bare metal
+    if [[ -f "$ENV_SH" ]]; then
+      # shellcheck disable=SC1090
+      source "$ENV_SH"
+    fi
+    # conda activation for non-interactive shells
+    if command -v conda >/dev/null 2>&1; then
+      # shellcheck disable=SC1091
+      source "$(conda info --base)/etc/profile.d/conda.sh"
+      conda activate "$CONDA_ENV"
+    fi
+    eval "$cmd"
+  fi
+}
+
+# Collect .h5 files:
+# - If INPUT_ROOT contains subfolders, we mirror them into OUTPUT_ROOT
+# - If INPUT_ROOT is flat, output goes directly into OUTPUT_ROOT
+shopt -s nullglob
+
+# Determine whether INPUT_ROOT has subdirectories with .h5 files
+SUBDIRS=( "$INPUT_ROOT"/*/ )
+if [[ ${#SUBDIRS[@]} -eq 0 ]]; then
+  # Flat directory case
+  H5_FILES=( "$INPUT_ROOT"/*.h5 )
+  if [[ ${#H5_FILES[@]} -eq 0 ]]; then
+    echo "No .h5 files found in INPUT_ROOT: $INPUT_ROOT" >&2
+    exit 1
+  fi
+
+  for H5_FILE in "${H5_FILES[@]}"; do
+    base=$(basename "$H5_FILE")
+    pred_name="${base%.h5}${PRED_SUFFIX}"
+    pred_path="$OUTPUT_ROOT/$pred_name"
+
+    if [[ -f "$pred_path" ]]; then
+      echo "Skipping (exists): $pred_path"
+      continue
+    fi
+
+    echo "Predicting: $H5_FILE"
+    run_cmd "python \"$SCRIPT_PATH\" --model_dir \"$MODEL_DIR\" --h5_file \"$H5_FILE\" --output_dir \"$OUTPUT_ROOT\""
+  done
+else
+  # Nested directories case
+  for SUBDIR in "${SUBDIRS[@]}"; do
+    # Remove trailing slash
+    SUBDIR="${SUBDIR%/}"
+    BASENAME=$(basename "$SUBDIR")
+    OUTDIR="$OUTPUT_ROOT/$BASENAME"
+    mkdir -p "$OUTDIR"
+
+    H5_FILES=( "$SUBDIR"/*.h5 )
+    if [[ ${#H5_FILES[@]} -eq 0 ]]; then
+      echo "No .h5 files found in: $SUBDIR (skipping)"
+      continue
+    fi
+
+    for H5_FILE in "${H5_FILES[@]}"; do
+      base=$(basename "$H5_FILE")
+      pred_name="${base%.h5}${PRED_SUFFIX}"
+      pred_path="$OUTDIR/$pred_name"
+
+      if [[ -f "$pred_path" ]]; then
+        echo "Skipping (exists): $pred_path"
+        continue
+      fi
+
+      echo "Predicting: $H5_FILE → $OUTDIR"
+      run_cmd "python \"$SCRIPT_PATH\" --model_dir \"$MODEL_DIR\" --h5_file \"$H5_FILE\" --output_dir \"$OUTDIR\""
+    done
+  done
+fi
+
+echo "Done."

@@ -1,0 +1,177 @@
+#!/bin/bash
+#SBATCH --job-name=sleap_predict
+#SBATCH --output=slurm_%j_sleap.out
+#SBATCH --error=slurm_%j_sleap.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=48:00:00
+#SBATCH --mem=128G
+#SBATCH --gres=gpu:1
+#SBATCH --mail-type=END
+#SBATCH --mail-user=YOUR_EMAIL_HERE
+
+set -euo pipefail
+
+module purge
+
+###############################################################################
+# SLEAP pose prediction (GPU): MP4 → SLP
+#
+# Inputs:   raw videos (.mp4)
+# Outputs:  tracked pose predictions (.slp)
+#
+# This script is written to be portable:
+# - Paths and key parameters can be overridden via environment variables.
+# - Default behavior loops over HOURS (07..18) and uses a filename pattern.
+#
+# Example:
+# sbatch --export=ALL,\
+#DATE=20250828,HOURS="07 08 09",\
+#VIDEO_DIR=/path/to/videos,\
+#PRED_DIR=/path/to/predictions,\
+#MODEL_1=/path/to/model1,MODEL_2=/path/to/model2,\
+#USE_CONTAINER=1,SIF_PATH=/path/to/ubuntu.sif,OVERLAY_PATH=/path/to/overlay.ext3:ro,\
+#ENV_SH=env.sh,SLEAP_ENV=sleap \
+#hpc/slurm_01_sleap_predict.sbatch
+###############################################################################
+
+# -----------------------------
+# User-configurable parameters
+# -----------------------------
+
+DATE="${DATE:-YYYYMMDD}"
+
+# Where your input videos live
+VIDEO_DIR="${VIDEO_DIR:-/path/to/videos}"
+
+# Where to write .slp predictions
+PRED_DIR="${PRED_DIR:-/path/to/sleap_predictions}"
+
+# SLEAP models (provide one or more; this template supports two)
+MODEL_1="${MODEL_1:-/path/to/sleap_model_1}"
+MODEL_2="${MODEL_2:-/path/to/sleap_model_2}"
+
+# Hours to process (space-separated)
+HOURS="${HOURS:-07 08 09 10 11 12 13 14 15 16 17 18}"
+
+# Filename pattern components
+CAMERA_PREFIX="${CAMERA_PREFIX:-basler_record_camera0}"
+VIDEO_EXT="${VIDEO_EXT:-mp4}"
+OUTPUT_SUFFIX="${OUTPUT_SUFFIX:-.mp4_tracked.slp}"
+
+# SLEAP conda env
+SLEAP_ENV="${SLEAP_ENV:-sleap}"
+
+# SLEAP tracking parameters (override if needed)
+MAX_TRACKING="${MAX_TRACKING:-1}"
+MAX_TRACKS="${MAX_TRACKS:-20}"
+TRACKER="${TRACKER:-simplemaxtracks}"
+SIMILARITY="${SIMILARITY:-centroid}"
+MATCH="${MATCH:-hungarian}"
+TRACK_WINDOW="${TRACK_WINDOW:-5}"
+VIDEO_INPUT_FORMAT="${VIDEO_INPUT_FORMAT:-channels_last}"
+GPU_FLAG="${GPU_FLAG:-auto}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+
+# -----------------------------
+# Container settings (optional)
+# If you are not using Singularity/Apptainer, set USE_CONTAINER=0
+# -----------------------------
+USE_CONTAINER="${USE_CONTAINER:-1}"
+SIF_PATH="${SIF_PATH:-/path/to/ubuntu-22.04.sif}"
+OVERLAY_PATH="${OVERLAY_PATH:-/path/to/overlay.ext3:ro}"
+ENV_SH="${ENV_SH:-env.sh}"
+
+mkdir -p "$PRED_DIR"
+
+echo "=== SLEAP pose prediction ==="
+echo "DATE        : $DATE"
+echo "VIDEO_DIR   : $VIDEO_DIR"
+echo "PRED_DIR    : $PRED_DIR"
+echo "MODEL_1     : $MODEL_1"
+echo "MODEL_2     : $MODEL_2"
+echo "HOURS       : $HOURS"
+echo "USE_CONTAINER: $USE_CONTAINER"
+echo
+
+# Basic checks
+if [[ ! -d "$VIDEO_DIR" ]]; then
+  echo "ERROR: VIDEO_DIR not found: $VIDEO_DIR" >&2
+  exit 1
+fi
+if [[ ! -e "$MODEL_1" ]]; then
+  echo "ERROR: MODEL_1 not found: $MODEL_1" >&2
+  exit 1
+fi
+if [[ ! -e "$MODEL_2" ]]; then
+  echo "ERROR: MODEL_2 not found: $MODEL_2" >&2
+  exit 1
+fi
+
+run_cmd() {
+  local cmd="$1"
+  if [[ "$USE_CONTAINER" == "1" ]]; then
+    if [[ ! -e "$SIF_PATH" ]]; then
+      echo "ERROR: SIF_PATH not found: $SIF_PATH" >&2
+      exit 1
+    fi
+    if [[ ! -e "${OVERLAY_PATH%%:*}" ]]; then
+      echo "ERROR: OVERLAY_PATH not found: ${OVERLAY_PATH%%:*}" >&2
+      exit 1
+    fi
+
+    singularity exec --nv \
+      --overlay "$OVERLAY_PATH" \
+      "$SIF_PATH" \
+      /bin/bash -lc "
+        set -euo pipefail
+        if [[ -f \"$ENV_SH\" ]]; then source \"$ENV_SH\"; fi
+        conda activate \"$SLEAP_ENV\"
+        $cmd
+      "
+  else
+    if [[ -f "$ENV_SH" ]]; then
+      # shellcheck disable=SC1090
+      source "$ENV_SH"
+    fi
+    if command -v conda >/dev/null 2>&1; then
+      # shellcheck disable=SC1091
+      source "$(conda info --base)/etc/profile.d/conda.sh"
+      conda activate "$SLEAP_ENV"
+    fi
+    eval "$cmd"
+  fi
+}
+
+# Run SLEAP for each hour
+for hr in $HOURS; do
+  INPUT_FILE="${VIDEO_DIR}/${CAMERA_PREFIX}_${DATE}_${hr}.${VIDEO_EXT}"
+  OUTPUT_FILE="${PRED_DIR}/${CAMERA_PREFIX}_${DATE}_${hr}${OUTPUT_SUFFIX}"
+
+  if [[ -f "$OUTPUT_FILE" ]]; then
+    echo "Skipping (exists): $OUTPUT_FILE"
+    continue
+  fi
+
+  if [[ ! -f "$INPUT_FILE" ]]; then
+    echo "WARNING: Missing input video: $INPUT_FILE (skipping hour $hr)"
+    continue
+  fi
+
+  echo "Tracking: $INPUT_FILE → $OUTPUT_FILE"
+
+  run_cmd "sleap-track \"$INPUT_FILE\" -m \"$MODEL_1\" -m \"$MODEL_2\" \
+    --tracking.max_tracking $MAX_TRACKING \
+    --tracking.max_tracks $MAX_TRACKS \
+    --video.input_format $VIDEO_INPUT_FORMAT \
+    --tracking.tracker $TRACKER \
+    --tracking.similarity $SIMILARITY \
+    --tracking.match $MATCH \
+    --tracking.track_window $TRACK_WINDOW \
+    --gpu $GPU_FLAG \
+    -o \"$OUTPUT_FILE\" \
+    --batch_size $BATCH_SIZE"
+done
+
+echo "Done."

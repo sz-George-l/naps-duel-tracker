@@ -1,0 +1,14 @@
+{
+  "window_size": 60,
+  "stride": 15,
+  "cluster_distance": 2,
+  "train_auc": 0.9998,
+  "window_precision": 0.9884,
+  "window_recall": 0.998,
+  "window_f1": 0.9932,
+  "height": 0.1,
+  "in_channels": 10,
+  "hidden": 32,
+  "node_dropout_rate": 0.2,
+  "best_cutoff": 0.87
+}
