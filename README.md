@@ -54,15 +54,25 @@ Hardware: GPU required
 
 Repository structure
 naps-duel-tracker/
+
 ├── envs/          # Conda environment definitions
+
 ├── hpc/           # SLURM batch scripts (GPU / CPU stages)
+
 ├── scripts/       # Helper scripts and utilities
+
 ├── src/           # Python modules (e.g. pose filtering)
+
 ├── models/        # Trained models (inference-ready)
+
 ├── data/
+
 │   └── sample/    # Small public example dataset
+
 ├── docs/          # Detailed documentation
+
 ├── configs/       # YAML configuration files
+
 └── README.md
 
 
