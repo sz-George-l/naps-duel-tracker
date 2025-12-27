@@ -1,0 +1,22 @@
+# Raw videos
+*.mp4
+*.avi
+*.mov
+
+# Tracking outputs
+*.slp
+*.h5
+
+# Large/private data
+data/training/
+data/analyzed/
+
+# HPC outputs
+slurm_*.out
+slurm_*.err
+overlay*.ext3
+
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
